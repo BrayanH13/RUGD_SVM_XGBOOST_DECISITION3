@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# Datos y artefactos (no subir el dataset ni modelos pesados)
+data/
+outputs/
+*.joblib
