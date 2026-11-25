@@ -21,3 +21,13 @@ COLOR_MAP = {
 }
 
 DEFAULT_PATCH_SIZE = 64
+
+# ---------------------------------------------------------------------------
+# Rutas por defecto (opcional)
+# Si las defines aquí puedes ejecutar `python train.py` (o F5 en el editor)
+# sin argumentos. Los argumentos de línea de comandos siempre tienen prioridad.
+# Usa r"..." para que Windows no interprete las barras invertidas.
+# ---------------------------------------------------------------------------
+DEFAULT_IMAGES_DIR = r"C:\Users\Brayan\Documents\Maestria\ML\RUGD_frames-with-annotations\trail"   # r"C:\ruta\RUGD_frames-with-annotations\trail"
+DEFAULT_MASKS_DIR =r"C:\Users\Brayan\Documents\Maestria\ML\RUGD_annotations"     # r"C:\ruta\annotations"
+DEFAULT_CLASS_DICT =  r"C:\Users\Brayan\Documents\Maestria\ML\rugd-landmarks-classification\dict (1).txt"

@@ -2,6 +2,7 @@
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from sklearn.metrics import ConfusionMatrixDisplay
 
 
@@ -57,10 +58,58 @@ def save_comparison(img, pred_mask, title, path, show=False):
 def save_confusion_matrix(y_true, y_pred, display_labels, path):
     fig, ax = plt.subplots(figsize=(6, 6))
     ConfusionMatrixDisplay.from_predictions(
-        y_true, y_pred, display_labels=display_labels,
+        y_true, y_pred, labels=np.arange(len(display_labels)), display_labels=display_labels,
         normalize="true", cmap="Greens", ax=ax, values_format=".2f",
     )
     ax.set_title("Matriz de confusión (normalizada)")
     plt.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+def plot_confusion_matrices(results, class_names, path, close=True):
+    """Una matriz de confusión por modelo, lado a lado, en una sola figura.
+
+    results : {nombre_modelo: (y_true, y_pred)}  (índices codificados 0..N-1)
+    """
+    n = len(results)
+    fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 5.4), squeeze=False)
+    for ax, (name, (y_true, y_pred)) in zip(axes[0], results.items()):
+        ConfusionMatrixDisplay.from_predictions(
+            y_true, y_pred, labels=np.arange(len(class_names)),
+            display_labels=class_names, normalize="true", cmap="Greens",
+            ax=ax, values_format=".2f", colorbar=False,
+        )
+        ax.set_title(f"{name}\nAccuracy: {(np.asarray(y_true) == np.asarray(y_pred)).mean():.3f}")
+        ax.tick_params(axis="x", rotation=30)
+    fig.suptitle("Matrices de confusión (normalizadas por fila)", fontweight="bold")
+    plt.tight_layout()
+    fig.savefig(path, dpi=150)
+    if close:
+        plt.close(fig)
+    return fig
+
+
+def plot_predictions(img, masks, color_map, class_names, path, close=True):
+    """Imagen original + la máscara predicha por cada modelo, con leyenda de colores.
+
+    masks : {nombre_modelo: máscara (H, W, 3)}
+    class_names : {id_rugd: nombre}
+    """
+    n = 1 + len(masks)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4.8), squeeze=False)
+    axes[0][0].imshow(img)
+    axes[0][0].set_title("Imagen original")
+    for ax, (name, mask) in zip(axes[0][1:], masks.items()):
+        ax.imshow(mask)
+        ax.set_title(f"Predicción {name}")
+    for ax in axes[0]:
+        ax.axis("off")
+    handles = [Patch(facecolor=tuple(c / 255 for c in color_map[k]), edgecolor="gray",
+                     label=class_names.get(k, str(k))) for k in color_map]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False)
+    plt.tight_layout(rect=(0, 0.07, 1, 1))
+    fig.savefig(path, dpi=150)
+    if close:
+        plt.close(fig)
+    return fig

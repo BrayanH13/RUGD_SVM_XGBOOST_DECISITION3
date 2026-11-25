@@ -24,7 +24,9 @@ def main():
     args = p.parse_args()
 
     bundle = joblib.load(args.model)
-    feature_fn = partial(extract_features, lbp_mode=bundle["lbp_mode"])
+    # modelos antiguos solo guardaban lbp_mode; los nuevos guardan todos los parámetros
+    params = bundle.get("feature_params") or {"lbp_mode": bundle.get("lbp_mode", "raw")}
+    feature_fn = partial(extract_features, **params)
     img = read_rgb(args.image)
     mask = reconstruct_image(img, bundle["model"], bundle["label_encoder"],
                              feature_fn, COLOR_MAP, bundle["patch_size"])
