@@ -40,6 +40,17 @@ def class_scores(clf, X, n_classes):
     return full, is_prob
 
 
+def image_to_patches(img, patch_size):
+    h, w = img.shape[:2]
+    Hp = max(patch_size, -(-h // patch_size) * patch_size)
+    Wp = max(patch_size, -(-w // patch_size) * patch_size)
+    padded = np.pad(img, ((0, Hp - h), (0, Wp - w), (0, 0)), mode="reflect")
+    nh, nw = Hp // patch_size, Wp // patch_size
+    patches = (padded.reshape(nh, patch_size, nw, patch_size, 3)
+               .transpose(0, 2, 1, 3, 4).reshape(nh * nw, patch_size, patch_size, 3))
+    return np.ascontiguousarray(patches), (Hp, Wp)
+
+
 def predict_map(img, clf, le, feature_fn, patch_size=64):
     """Clasifica la imagen por parches de ``patch_size`` y devuelve (ids, confianza, es_probabilidad).
 
@@ -48,22 +59,14 @@ def predict_map(img, clf, le, feature_fn, patch_size=64):
       ids  : (H, W) IDs de clase de RUGD
       conf : (H, W) puntaje de la clase elegida en [0, 1]
     """
+    from src.gpu_features import batch_features
+
     h, w = img.shape[:2]
-    Hp = max(patch_size, -(-h // patch_size) * patch_size)
-    Wp = max(patch_size, -(-w // patch_size) * patch_size)
-    padded = np.pad(img, ((0, Hp - h), (0, Wp - w), (0, 0)), mode="reflect")
-
-    coords, feats = [], []
-    for y in range(0, Hp, patch_size):
-        for x in range(0, Wp, patch_size):
-            coords.append((y, x))
-            feats.append(feature_fn(padded[y:y + patch_size, x:x + patch_size]))
-
-    scores, is_prob = class_scores(clf, np.array(feats), len(le.classes_))
-    full = np.zeros((Hp, Wp, scores.shape[1]), dtype=np.float32)
-    for (y, x), sc in zip(coords, scores):
-        full[y:y + patch_size, x:x + patch_size] = sc
-    full = full[:h, :w]
+    patches, (Hp, Wp) = image_to_patches(img, patch_size)
+    nh, nw = Hp // patch_size, Wp // patch_size
+    scores, is_prob = class_scores(clf, batch_features(feature_fn, patches), len(le.classes_))
+    grid = scores.reshape(nh, nw, -1)
+    full = np.repeat(np.repeat(grid, patch_size, axis=0), patch_size, axis=1)[:h, :w]
     return np.asarray(le.classes_)[full.argmax(axis=2)], full.max(axis=2), is_prob
 
 

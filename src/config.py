@@ -26,8 +26,31 @@ DEFAULT_PATCH_SIZE = 64
 # Rutas por defecto (opcional)
 # Si las defines aquí puedes ejecutar `python train.py` (o F5 en el editor)
 # sin argumentos. Los argumentos de línea de comandos siempre tienen prioridad.
-# Usa r"..." para que Windows no interprete las barras invertidas.
 # ---------------------------------------------------------------------------
-DEFAULT_IMAGES_DIR = r"C:\Users\Brayan\Documents\Maestria\ML\RUGD_frames-with-annotations\trail"   # r"C:\ruta\RUGD_frames-with-annotations\trail"
-DEFAULT_MASKS_DIR =r"C:\Users\Brayan\Documents\Maestria\ML\RUGD_annotations"     # r"C:\ruta\annotations"
-DEFAULT_CLASS_DICT =  r"C:\Users\Brayan\Documents\Maestria\ML\rugd-landmarks-classification\dict (1).txt"
+# Usa r"..." para que Windows no interprete las barras invertidas.
+from pathlib import Path as _Path
+
+_ROOT = _Path(__file__).resolve().parent.parent
+
+
+def _first_existing(*paths):
+    for p in paths:
+        if p and _Path(p).exists():
+            return str(p)
+    return str(paths[0]) if paths else None
+
+
+DEFAULT_IMAGES_DIR = _first_existing(
+    r"C:\Users\Brayan\Documents\Maestria\ML\RUGD_frames-with-annotations\trail",
+    _ROOT / "data" / "RUGD_frames-with-annotations",
+)
+DEFAULT_MASKS_DIR = _first_existing(
+    r"C:\Users\Brayan\Documents\Maestria\ML\RUGD_annotations",
+    _ROOT / "data" / "RUGD_annotations",
+)
+DEFAULT_CLASS_DICT = _first_existing(
+    _ROOT / "data" / "RUGD_annotations" / "RUGD_annotation-colormap.txt",
+    _ROOT / "dict (1).txt",
+)
+
+DEFAULT_TEST_SCENES = "trail-5,trail-12,park-2"

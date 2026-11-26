@@ -11,8 +11,8 @@ Ejemplos:
 """
 import argparse
 import random
+import time
 from collections import Counter
-from functools import partial
 from pathlib import Path
 
 import joblib
@@ -21,15 +21,14 @@ import numpy as np
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.svm import SVC
-from sklearn.tree import DecisionTreeClassifier
 
 from src.config import (DEFAULT_CLASS_DICT, DEFAULT_IMAGES_DIR, DEFAULT_MASKS_DIR,
-                        DEFAULT_PATCH_SIZE, TARGET_CLASSES)
+                        DEFAULT_PATCH_SIZE, DEFAULT_TEST_SCENES, TARGET_CLASSES)
 from src.traversability import COLORS as COLOR_MAP, NAMES as CLASS_NAMES
 from src.dataset import (build_dataset, diagnose_pairing, load_class_dict,
                         pair_images_and_masks, read_rgb)
-from src.features import extract_features
+from src.gpu_features import describe_device, make_feature_fn, resolve_device
+from src.gpu_models import build_model
 
 MODEL_KEYS = ["svm", "xgboost", "tree"]
 DISPLAY_NAMES = {"svm": "SVM", "xgboost": "XGBoost", "tree": "Árbol de decisión"}
@@ -62,9 +61,29 @@ def parse_args():
                    help="Bins de orientación de HOG (9 = original)")
     p.add_argument("--hog-cell", type=int, default=8,
                    help="Tamaño de celda de HOG en px (8 = original; menor = más detalle y más dimensiones)")
-    p.add_argument("--test-size", type=float, default=0.3)
+    p.add_argument("--test-size", type=float, default=0.3,
+                   help="Fracción de test (solo con --split random)")
+    p.add_argument("--split", choices=["scene", "random"], default="scene",
+                   help="scene: escenas completas para test (sin fuga entre train y test, recomendado)\n"
+                        "random: parches al azar (versión original; frames casi iguales caen en train y test)")
+    p.add_argument("--test-scenes", default=DEFAULT_TEST_SCENES,
+                   help="Escenas (carpetas) que se dejan por fuera para test, separadas por coma")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", default="outputs")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                   help="Dispositivo: auto (GPU si hay), cuda o cpu")
+    p.add_argument("--gpu-batch", type=int, default=8192,
+                   help="Parches por lote en la GPU (bájalo si falta memoria de video)")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Hilos para leer imágenes y máscaras en paralelo")
+    p.add_argument("--svm-impl", choices=["torch", "sklearn"], default="torch",
+                   help="torch: SVM lineal en GPU (LinearSVC + estandarización) | sklearn: SVC original en CPU")
+    p.add_argument("--balance", default="none",
+                   help="Balanceo de clases con pesos por muestra, uno o varios separados por coma:\n"
+                        "none (sin balanceo) | balanced (peso = 1/frecuencia) | sqrt (raíz de balanced, más suave)\n"
+                        "Ej.: --balance none,sqrt,balanced entrena cada modelo con cada variante")
+    p.add_argument("--svm-c", type=float, default=1.0, help="Parámetro C del SVM")
+    p.add_argument("--svm-iters", type=int, default=300, help="Iteraciones máximas de L-BFGS del SVM")
     p.add_argument("--no-show", action="store_true",
                    help="No abrir ventanas (solo guardar las figuras en --output-dir)")
     args = p.parse_args()
@@ -74,16 +93,6 @@ def parse_args():
         p.error("faltan las rutas " + ", ".join(missing) + ". Pásalas por argumento o defínelas "
                 "en src/config.py (DEFAULT_IMAGES_DIR, DEFAULT_MASKS_DIR, DEFAULT_CLASS_DICT).")
     return args
-
-
-def build_model(name, seed, max_depth=None):
-    if name == "svm":
-        return SVC(kernel="linear")
-    if name == "tree":
-        return DecisionTreeClassifier(max_depth=max_depth, random_state=seed)
-    from xgboost import XGBClassifier  # import perezoso: solo si se usa
-    return XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
-                         eval_metric="mlogloss", random_state=seed)
 
 
 def main():
@@ -106,7 +115,9 @@ def main():
         "hog_orientations": args.hog_orientations,
         "hog_cell": args.hog_cell,
     }
-    feature_fn = partial(extract_features, **feature_params)
+    device = resolve_device(args.device)
+    print(f"Dispositivo: {describe_device(device)}")
+    feature_fn = make_feature_fn(feature_params, device=device, batch_size=args.gpu_batch)
     class_dict = load_class_dict(args.class_dict)
 
     # 1. Dataset
@@ -128,7 +139,11 @@ def main():
     print(f"Pares imagen/máscara totales: {len(pairs)}")
     stats = Counter()
     classes = [int(c) for c in args.classes.split(",")] if args.classes else TARGET_CLASSES
-    X, y, _ = build_dataset(pairs, class_dict, feature_fn, args.patch_size, classes, stats=stats)
+    t0 = time.time()
+    X, y, _, groups = build_dataset(pairs, class_dict, feature_fn, args.patch_size, classes,
+                                    stats=stats, workers=args.workers, gpu_batch=args.gpu_batch,
+                                    return_groups=True)
+    print(f"Extracción de características: {time.time() - t0:.1f} s")
     print(f"Parches candidatos: {stats['candidatos']} | fuera de clases objetivo: {stats['fuera_de_clases']}"
           f" | aceptados: {stats['aceptados']}")
     dom = {int(k.split("_")[1]): v for k, v in stats.items() if k.startswith("dominante_")}
@@ -154,41 +169,107 @@ def main():
     print("Parches por clase:", {n: int(c) for n, c in zip(names, counts)})
 
     # 3. Split (el mismo para todos los modelos, estratificado si es posible)
-    stratify = y_enc if counts.min() >= 2 else None
-    if stratify is None:
-        print("Aviso: hay una clase con 1 parche; el split no se estratifica.")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_enc, test_size=args.test_size, random_state=args.seed, stratify=stratify
-    )
+    if args.split == "scene":
+        test_scenes = [t.strip() for t in args.test_scenes.split(",") if t.strip()]
+        present = sorted(set(groups))
+        missing = [t for t in test_scenes if t not in present]
+        if missing:
+            raise SystemExit(f"Escenas de test no encontradas: {missing}. Escenas cargadas: {present}")
+        is_test = np.isin(groups, test_scenes)
+        if is_test.all() or not is_test.any():
+            raise SystemExit("El split por escenas dejó train o test vacío; revisa --test-scenes.")
+        X_train, X_test = X[~is_test], X[is_test]
+        y_train, y_test = y_enc[~is_test], y_enc[is_test]
+        print(f"Split por escenas | test: {', '.join(test_scenes)}")
+        print(f"  train: {len(y_train)} parches de {len(set(groups[~is_test]))} escenas"
+              f" | test: {len(y_test)} parches de {len(test_scenes)} escenas")
+        for split_name, yy in (("train", y_train), ("test", y_test)):
+            c = np.bincount(yy, minlength=len(names))
+            print(f"  {split_name:<5}", {n: int(v) for n, v in zip(names, c)})
+        lost = [n for n, c in zip(names, np.bincount(y_train, minlength=len(names))) if c == 0]
+        if lost:
+            print(f"  AVISO: clases sin ejemplos en train: {lost}")
+    else:
+        stratify = y_enc if counts.min() >= 2 else None
+        if stratify is None:
+            print("Aviso: hay una clase con 1 parche; el split no se estratifica.")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_enc, test_size=args.test_size, random_state=args.seed, stratify=stratify
+        )
+        test_scenes = []
+        print("Split aleatorio por parche (puede sobreestimar las métricas)")
+
+    majority = np.bincount(y_train).argmax()
+    base_pred = np.full_like(y_test, majority)
+    results_base = (y_test, base_pred)
 
     # 4. Entrenar y evaluar cada modelo
+    from sklearn.utils.class_weight import compute_sample_weight
     keys = MODEL_KEYS if args.model == "all" else [args.model]
-    results, trained = {}, {}
-    for key in keys:
-        label = DISPLAY_NAMES[key]
-        print(f"\n===== {label} =====")
-        clf = build_model(key, args.seed, args.max_depth)
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
-        print(classification_report(y_test, y_pred, labels=np.arange(len(names)),
-                                    target_names=names, zero_division=0))
-        results[label] = (y_test, y_pred)
-        trained[label] = clf
-        joblib.dump({"model": clf, "label_encoder": le, "patch_size": args.patch_size,
-                     "lbp_mode": args.lbp_mode,
-                     "feature_params": feature_params}, out_dir / f"model_{key}.joblib")
+    balances = [v.strip() for v in args.balance.split(",") if v.strip()]
+    for v in balances:
+        if v not in ("none", "balanced", "sqrt"):
+            raise SystemExit(f"--balance inválido: {v!r} (usa none, balanced o sqrt)")
+    results, trained, times = {}, {}, {}
+    for bal in balances:
+        if bal == "none":
+            sw = None
+        else:
+            sw = compute_sample_weight("balanced", y_train)
+            if bal == "sqrt":
+                sw = np.sqrt(sw)
+            w_cls = {n: round(float(sw[y_train == i][0]), 2) for i, n in enumerate(names) if (y_train == i).any()}
+            print(f"\nPesos por clase ({bal}): {w_cls}")
+        for key in keys:
+            label = DISPLAY_NAMES[key] if len(balances) == 1 and bal == "none" else f"{DISPLAY_NAMES[key]} [{bal}]"
+            print(f"\n===== {label} =====")
+            clf = build_model(key, args.seed, args.max_depth, device=device.type,
+                              svm_c=args.svm_c, svm_iters=args.svm_iters, svm_impl=args.svm_impl)
+            t0 = time.time()
+            if sw is None:
+                clf.fit(X_train, y_train)
+            else:
+                clf.fit(X_train, y_train, sample_weight=sw)
+            where = "CPU" if key == "tree" or (key == "svm" and args.svm_impl == "sklearn") else device.type.upper()
+            times[label] = round(time.time() - t0, 1)
+            print(f"Entrenamiento ({where}): {times[label]:.1f} s")
+            y_pred = clf.predict(X_test)
+            print(classification_report(y_test, y_pred, labels=np.arange(len(names)),
+                                        target_names=names, zero_division=0))
+            results[label] = (y_test, y_pred)
+            trained[label] = clf
+            suffix = "" if bal == "none" else f"_{bal}"
+            joblib.dump({"model": clf, "label_encoder": le, "patch_size": args.patch_size,
+                         "lbp_mode": args.lbp_mode, "balance": bal,
+                         "feature_params": feature_params}, out_dir / f"model_{key}{suffix}.joblib")
 
     # 5. Resumen comparativo
     print("\n===== Resumen (conjunto de test) =====")
-    print(f"{'Modelo':<20}{'Accuracy':>10}{'F1 macro':>11}")
-    for label, (yt, yp) in results.items():
-        print(f"{label:<20}{accuracy_score(yt, yp):>10.3f}"
-              f"{f1_score(yt, yp, average='macro', zero_division=0):>11.3f}")
+    print(f"{'Modelo':<28}{'Accuracy':>10}{'F1 macro':>11}")
+    rows = []
+    for label, (yt, yp) in [(f"Línea base ({names[majority]})", results_base)] + list(results.items()):
+        acc = accuracy_score(yt, yp)
+        f1 = f1_score(yt, yp, average="macro", labels=np.unique(yt), zero_division=0)
+        print(f"{label:<28}{acc:>10.3f}{f1:>11.3f}")
+        rec = {"modelo": label, "accuracy": round(acc, 4), "f1_macro": round(f1, 4),
+               "split": args.split, "test_scenes": ";".join(test_scenes),
+               "n_train": len(y_train), "n_test": len(y_test), "tiempo_s": times.get(label, "")}
+        per = f1_score(yt, yp, average=None, labels=np.arange(len(names)), zero_division=0)
+        rec.update({f"f1_{n}": round(v, 4) for n, v in zip(names, per)})
+        rows.append(rec)
+    import csv
+    csv_path = out_dir / "resultados.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Tabla guardada en {csv_path}")
 
     # 6. Figuras: matriz de confusión por modelo + predicción por modelo
     plot_confusion_matrices(results, names, out_dir / "confusion_matrices.png", close=not show)
 
-    img_path, _ = random.choice(pairs)
+    demo_pairs = [p for p in pairs if Path(p[0]).parent.name in test_scenes] or pairs
+    img_path, _ = random.choice(demo_pairs)
     img = read_rgb(img_path)
     masks = {label: reconstruct_image(img, clf, le, feature_fn, COLOR_MAP, args.patch_size)
              for label, clf in trained.items()}

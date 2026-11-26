@@ -13,23 +13,16 @@ def reconstruct_image(img, clf, le, feature_fn, color_map, patch_size=64):
     - Predice todos los parches en una sola llamada (más rápido).
     - Usa ``le.inverse_transform`` para volver de índices [0..N-1] a IDs RUGD.
     """
+    from src.gpu_features import batch_features
+    from src.inference import image_to_patches
+
     h, w, _ = img.shape
-    pad_h = (-h) % patch_size
-    pad_w = (-w) % patch_size
-    padded = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
-    H, W, _ = padded.shape
-
-    coords, feats = [], []
-    for y in range(0, H, patch_size):
-        for x in range(0, W, patch_size):
-            coords.append((y, x))
-            feats.append(feature_fn(padded[y:y + patch_size, x:x + patch_size]))
-
-    pred_ids = le.inverse_transform(clf.predict(np.array(feats)))
-
-    out = np.zeros((H, W, 3), dtype=np.uint8)
-    for (y, x), cid in zip(coords, pred_ids):
-        out[y:y + patch_size, x:x + patch_size] = color_map.get(int(cid), (0, 0, 0))
+    patches, (H, W) = image_to_patches(img, patch_size)
+    nh, nw = H // patch_size, W // patch_size
+    pred_ids = le.inverse_transform(clf.predict(batch_features(feature_fn, patches)))
+    lut = {int(c): color_map.get(int(c), (0, 0, 0)) for c in np.unique(pred_ids)}
+    grid = np.array([lut[int(c)] for c in pred_ids], dtype=np.uint8).reshape(nh, nw, 3)
+    out = np.repeat(np.repeat(grid, patch_size, axis=0), patch_size, axis=1)
     return out[:h, :w]
 
 
@@ -73,8 +66,12 @@ def plot_confusion_matrices(results, class_names, path, close=True):
     results : {nombre_modelo: (y_true, y_pred)}  (índices codificados 0..N-1)
     """
     n = len(results)
-    fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 5.4), squeeze=False)
-    for ax, (name, (y_true, y_pred)) in zip(axes[0], results.items()):
+    ncols = min(n, 3)
+    nrows = -(-n // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6 * ncols, 5.4 * nrows), squeeze=False)
+    for ax in axes.flat[n:]:
+        ax.axis("off")
+    for ax, (name, (y_true, y_pred)) in zip(axes.flat, results.items()):
         ConfusionMatrixDisplay.from_predictions(
             y_true, y_pred, labels=np.arange(len(class_names)),
             display_labels=class_names, normalize="true", cmap="Greens",
@@ -97,18 +94,21 @@ def plot_predictions(img, masks, color_map, class_names, path, close=True):
     class_names : {id_rugd: nombre}
     """
     n = 1 + len(masks)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4.8), squeeze=False)
-    axes[0][0].imshow(img)
-    axes[0][0].set_title("Imagen original")
-    for ax, (name, mask) in zip(axes[0][1:], masks.items()):
+    ncols = min(n, 4)
+    nrows = -(-n // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.8 * nrows), squeeze=False)
+    flat = list(axes.flat)
+    flat[0].imshow(img)
+    flat[0].set_title("Imagen original")
+    for ax, (name, mask) in zip(flat[1:], masks.items()):
         ax.imshow(mask)
         ax.set_title(f"Predicción {name}")
-    for ax in axes[0]:
+    for ax in flat:
         ax.axis("off")
     handles = [Patch(facecolor=tuple(c / 255 for c in color_map[k]), edgecolor="gray",
                      label=class_names.get(k, str(k))) for k in color_map]
     fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False)
-    plt.tight_layout(rect=(0, 0.07, 1, 1))
+    plt.tight_layout(rect=(0, 0.07 / nrows, 1, 1))
     fig.savefig(path, dpi=150)
     if close:
         plt.close(fig)

@@ -23,14 +23,25 @@ def load_class_dict(path_txt):
     return class_dict
 
 
+def _color_keys(class_dict):
+    items = sorted(((r << 16) | (g << 8) | b, idx) for (r, g, b), idx in class_dict.items())
+    keys = np.array([k for k, _ in items], dtype=np.int64)
+    ids = np.array([i for _, i in items], dtype=np.int64)
+    return keys, ids
+
+
 def mask_to_ids(mask_path, class_dict):
     """Convierte una máscara RGB en una matriz (H, W) de IDs de clase."""
-    mask = np.array(Image.open(mask_path).convert("RGB"))
-    h, w, _ = mask.shape
-    ids = np.zeros((h, w), dtype=np.int64)
-    for (r, g, b), idx in class_dict.items():
-        ids[(mask[:, :, 0] == r) & (mask[:, :, 1] == g) & (mask[:, :, 2] == b)] = idx
-    return ids
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_COLOR)
+    if mask is None:
+        mask = np.array(Image.open(mask_path).convert("RGB"))
+    else:
+        mask = mask[:, :, ::-1]
+    code = ((mask[:, :, 0].astype(np.int64) << 16) | (mask[:, :, 1].astype(np.int64) << 8)
+            | mask[:, :, 2].astype(np.int64))
+    keys, ids = _color_keys(class_dict)
+    pos = np.clip(np.searchsorted(keys, code), 0, len(keys) - 1)
+    return np.where(keys[pos] == code, ids[pos], 0)
 
 
 def enumerate_patches(mask_ids, patch_size=64, target_classes=None, stats=None):
@@ -42,17 +53,23 @@ def enumerate_patches(mask_ids, patch_size=64, target_classes=None, stats=None):
     """
     stats = stats if stats is not None else Counter()
     h, w = mask_ids.shape
-    out = []
-    for y in range(0, h - patch_size + 1, patch_size):
-        for x in range(0, w - patch_size + 1, patch_size):
-            label = int(np.bincount(mask_ids[y:y + patch_size, x:x + patch_size].ravel()).argmax())
-            stats["candidatos"] += 1
-            stats[f"dominante_{label}"] += 1
-            if target_classes is not None and label not in target_classes:
-                stats["fuera_de_clases"] += 1
-                continue
-            out.append((y, x, label))
-    return out
+    nh, nw = h // patch_size, w // patch_size
+    if nh == 0 or nw == 0:
+        return []
+    m = mask_ids[:nh * patch_size, :nw * patch_size]
+    blocks = m.reshape(nh, patch_size, nw, patch_size).transpose(0, 2, 1, 3).reshape(nh * nw, -1)
+    k = int(blocks.max()) + 1
+    offs = (np.arange(nh * nw) * k)[:, None]
+    counts = np.bincount((blocks + offs).ravel(), minlength=nh * nw * k).reshape(nh * nw, k)
+    labels = counts.argmax(1)
+
+    stats["candidatos"] += len(labels)
+    for lab, c in zip(*np.unique(labels, return_counts=True)):
+        stats[f"dominante_{int(lab)}"] += int(c)
+    keep = np.ones(len(labels), bool) if target_classes is None else np.isin(labels, list(target_classes))
+    stats["fuera_de_clases"] += int((~keep).sum())
+    idx = np.nonzero(keep)[0]
+    return [(int(i // nw) * patch_size, int(i % nw) * patch_size, int(labels[i])) for i in idx]
 
 
 def generate_patches(img, mask_ids, patch_size=64, target_classes=None):
@@ -173,23 +190,58 @@ def read_rgb(path):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def build_dataset(pairs, class_dict, feature_fn, patch_size=64, target_classes=None, stats=None):
+def _load_pair(args):
+    img_path, mask_path, class_dict, patch_size, target_classes = args
+    stats = Counter()
+    mask_ids = mask_to_ids(mask_path, class_dict)
+    coords = enumerate_patches(mask_ids, patch_size, target_classes, stats)
+    if not coords:
+        return None, [], stats
+    img = read_rgb(img_path)
+    patches = np.stack([img[y:y + patch_size, x:x + patch_size] for y, x, _ in coords])
+    return patches, [lab for _, _, lab in coords], stats
+
+
+def build_dataset(pairs, class_dict, feature_fn, patch_size=64, target_classes=None, stats=None,
+                  workers=8, return_patches=False, gpu_batch=8192, progress=True, return_groups=False):
     """Recorre los pares (imagen, máscara) y devuelve X, y y la lista de parches originales.
 
     ``stats`` (Counter opcional) se rellena con los conteos de parches candidatos y aceptados.
     """
+    from concurrent.futures import ThreadPoolExecutor
+    from src.gpu_features import batch_features
+
     stats = stats if stats is not None else Counter()
-    X, y_out, patches_list = [], [], []
-    for img_path, mask_path in pairs:
-        mask_ids = mask_to_ids(mask_path, class_dict)
-        coords = enumerate_patches(mask_ids, patch_size, target_classes, stats)
-        if not coords:
-            continue
-        img = read_rgb(img_path)
-        for y, x, label in coords:
-            patch = img[y:y + patch_size, x:x + patch_size]
-            X.append(feature_fn(patch))
-            y_out.append(label)
-            patches_list.append(patch)
+    X, y_out, patches_list, groups = [], [], [], []
+    buf, buf_n = [], 0
+
+    def flush():
+        nonlocal buf, buf_n
+        if buf:
+            X.append(batch_features(feature_fn, np.concatenate(buf)))
+            buf, buf_n = [], 0
+
+    jobs = ((ip, mp, class_dict, patch_size, target_classes) for ip, mp in pairs)
+    total = len(pairs)
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        for i, ((img_path, _), (patches, labels, st)) in enumerate(zip(pairs, ex.map(_load_pair, jobs)), 1):
+            stats.update(st)
+            if patches is not None:
+                buf.append(patches)
+                buf_n += len(patches)
+                y_out.extend(labels)
+                groups.extend([Path(img_path).parent.name] * len(labels))
+                if return_patches:
+                    patches_list.extend(patches)
+                if buf_n >= gpu_batch:
+                    flush()
+            if progress and (i % 50 == 0 or i == total):
+                print(f"\r  imágenes procesadas: {i}/{total} | parches: {len(y_out)}", end="", flush=True)
+    flush()
+    if progress and total:
+        print()
     stats["aceptados"] = len(y_out)
-    return np.array(X), np.array(y_out), patches_list
+    X = np.concatenate(X) if X else np.zeros((0, 0), np.float32)
+    if return_groups:
+        return X, np.array(y_out), patches_list, np.array(groups)
+    return X, np.array(y_out), patches_list

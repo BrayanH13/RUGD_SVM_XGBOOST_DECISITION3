@@ -96,6 +96,53 @@ Más bins no garantiza mejor resultado: aumenta las dimensiones, hace los histog
 Conviene cambiar un parámetro a la vez y comparar con la tabla resumen que imprime `train.py`.
 `--color-mode channels` permite bins muy finos sin que el vector se dispare.
 
+## Ejecución en GPU (NVIDIA / CUDA)
+
+El proyecto corre en la tarjeta gráfica con PyTorch:
+
+| Etapa | Dónde corre | Detalle |
+|-------|-------------|---------|
+| HOG + LBP + histograma de color | **GPU** | `src/gpu_features.py`: réplica por lotes de skimage/OpenCV (diferencia < 1e-7) |
+| Máscaras → IDs y etiqueta por parche | CPU vectorizado + hilos | `src/dataset.py` |
+| SVM | **GPU** | `TorchLinearSVC`: SVM lineal uno-contra-resto (hinge², L2, como `LinearSVC`) con L-BFGS y estandarización |
+| XGBoost | **GPU** | `tree_method="hist", device="cuda"` |
+| Árbol de decisión | CPU | scikit-learn no tiene árbol en GPU (es el más rápido de los tres) |
+| Inferencia (`predict.py`, `app.py`) | **GPU** si hay | todos los parches de la imagen en un solo lote |
+
+**Instalación** (primero PyTorch con CUDA; el `torch` de PyPI en Windows es solo CPU):
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # ver pytorch.org para tu CUDA
+pip install -r requirements.txt
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+**Datos:** imágenes en `RUGD_frames-with-annotations` y máscaras en **`RUGD_annotations`**
+(el dataset de anotaciones: una máscara RGB por frame, con el mismo nombre de archivo; de ahí sale la
+etiqueta de cada parche). El colormap es `RUGD_annotation-colormap.txt` o `dict (1).txt`.
+
+```bash
+python train.py --device cuda \
+  --images-dir data/RUGD_frames-with-annotations --masks-dir data/RUGD_annotations \
+  --class-dict "dict (1).txt" --scene-glob "trail*" --classes 1,3,4,11,19,21 --no-show
+```
+
+Opciones nuevas:
+
+| Argumento | Default | Descripción |
+|-----------|---------|-------------|
+| `--device` | `auto` | `auto` (GPU si hay), `cuda` o `cpu` |
+| `--gpu-batch` | `8192` | Parches por lote en la GPU; bájalo (2048) si sale *CUDA out of memory* |
+| `--workers` | `8` | Hilos de lectura de imágenes y máscaras |
+| `--svm-impl` | `torch` | `torch` = SVM lineal en GPU; `sklearn` = `SVC(kernel="linear")` original en CPU |
+| `--svm-c`, `--svm-iters` | `1.0`, `300` | C del SVM e iteraciones de L-BFGS |
+
+Notas:
+- El SVM en GPU no es idéntico al `SVC` original (uno-contra-uno, hinge, sin escalado): es un
+  `LinearSVC` con `StandardScaler`, que escala a cientos de miles de parches. Sus resultados pueden
+  variar un poco; `--svm-impl sklearn` reproduce el original.
+- Los `.joblib` entrenados en GPU se pueden usar en un equipo sin GPU (se pasa a CPU automáticamente).
+
 ## Instalación
 
 ```bash
@@ -191,7 +238,9 @@ Notas:
 ├── src/
 │   ├── config.py       # clases objetivo y mapa de colores
 │   ├── dataset.py      # lectura de máscaras, parches, emparejado, construcción de X/y
-│   ├── features.py     # HOG + LBP + histograma de color
+│   ├── features.py     # HOG + LBP + histograma de color (CPU, referencia)
+│   ├── gpu_features.py # mismo extractor por lotes en GPU (PyTorch)
+│   ├── gpu_models.py   # SVM lineal en GPU, XGBoost CUDA, árbol
 │   ├── inference.py    # predicción por imagen/video con confianza por píxel
 │   ├── traversability.py  # clase -> nivel de transitabilidad, resumen, superposición
 │   └── visualize.py    # reconstrucción de máscara, superposición, matriz de confusión
@@ -219,8 +268,12 @@ Notas:
   tiende a sobreajustar; prueba valores como 5–15. No necesita escalado de características.
 - **Escalado.** El SVM lineal (no el árbol ni XGBoost) es sensible a la escala de las características (HOG ∈ [0,1], histograma de
   color en conteos). Probar `StandardScaler` suele mejorar y acelerar la convergencia.
-- **Partición.** El `train_test_split` es aleatorio por parche, por lo que parches de una misma imagen
-  pueden caer en train y test; para una evaluación más estricta conviene separar por imagen o por escena.
+- **Partición.** Por defecto (`--split scene`) se dejan escenas completas por fuera para test
+  (`--test-scenes`, por defecto `trail-5,trail-12,park-2`: contienen tierra y roca, clases escasas, y
+  park-2 mide generalización). Con `--split random` (versión original) el split es aleatorio por parche:
+  parches de una misma imagen y frames consecutivos casi idénticos caen en train y test, lo que
+  sobreestima las métricas. `train.py` imprime además una **línea base** (predecir siempre la clase
+  más frecuente) y guarda la tabla de resultados en `outputs/resultados.csv`.
 
 ## Resultados
 

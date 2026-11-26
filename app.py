@@ -6,7 +6,6 @@ Requiere un modelo entrenado con train.py (outputs/model_*.joblib).
 """
 import os
 import tempfile
-from functools import partial
 from pathlib import Path
 
 import joblib
@@ -15,7 +14,8 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from src.features import extract_features
+from src.gpu_features import describe_device, make_feature_fn, resolve_device
+from src.gpu_models import prepare_for_inference
 from src.inference import predict_map, resize_max_width, sample_video_frames
 from src.traversability import (ES_NAMES, LEVEL_COLORS, LEVELS, TRAVERSABILITY,
                                 render_overlay, summarize)
@@ -26,9 +26,14 @@ st.caption("Sube una imagen o un video del recorrido: el sistema marca la clase 
            "nivel de transitabilidad, con el porcentaje de cada superficie y la confianza.")
 
 
+DEVICE = resolve_device("auto")
+
+
 @st.cache_resource
 def load_bundle(path):
-    return joblib.load(path)
+    bundle = joblib.load(path)
+    prepare_for_inference(bundle["model"], DEVICE.type)
+    return bundle
 
 
 # ---------------------------- barra lateral ----------------------------
@@ -58,7 +63,8 @@ except Exception as e:  # noqa: BLE001
 
 patch = bundle["patch_size"]
 params = bundle.get("feature_params") or {"lbp_mode": bundle.get("lbp_mode", "raw")}
-feature_fn = partial(extract_features, **params)
+feature_fn = make_feature_fn(params, device=DEVICE)
+st.sidebar.caption(f"Dispositivo: {describe_device(DEVICE)}")
 trained = [ES_NAMES.get(int(c), str(int(c))) for c in bundle["label_encoder"].classes_]
 st.sidebar.caption("Clases del modelo: " + ", ".join(trained))
 if not any(lv == "transitable" and c in bundle["label_encoder"].classes_
